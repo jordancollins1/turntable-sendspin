@@ -45,9 +45,12 @@ For the Music Assistant card, configure the Home Assistant REST endpoint for the
 MA_URL=http://homeassistant:8123
 MA_TOKEN=<Home Assistant long-lived access token>
 MA_ENTITY=media_player.turntable
+AUDD_TOKEN=
 ```
 
 The token is only read from the container environment and is never shown in the dashboard. If Music Assistant is running standalone rather than through Home Assistant, leave these fields empty until its supported status API is selected.
+
+The dashboard also has manual artist, album, and track fields. Use **Set metadata** for the dependable vinyl workflow. To enable optional recognition, add an AudD API token as `AUDD_TOKEN`; the **Recognize** button analyzes a short rolling audio sample. Shazam does not offer a supported server-side API for this Docker workflow.
 
 ## First run
 

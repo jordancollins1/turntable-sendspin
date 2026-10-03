@@ -12,3 +12,9 @@ A small Unraid control plane for a USB turntable preamp connected to a Raspberry
 6. Open the Sendspin pairing portal from the dashboard or at `http://UNRAID_IP:8927`.
 
 Do not commit `.env`, SSH keys, or Music Assistant tokens. See `TURNtable_UNRAID.md` for the full setup and troubleshooting guide.
+
+## Track metadata
+
+The dashboard supports manual artist, album, and track entry. This metadata is kept by the bridge for the current session and is the reliable option for vinyl.
+
+Recognition is optional. Set `AUDD_TOKEN` in `.env` to enable the **Recognize** button. It sends a short rolling WAV sample to AudD, then fills the metadata fields when a match is found. Shazam does not provide a supported server-side API suitable for this container, so AudD is used as the pluggable recognition provider.

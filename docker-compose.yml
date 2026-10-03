@@ -19,3 +19,4 @@ services:
       MA_URL: ${MA_URL:-}
       MA_TOKEN: ${MA_TOKEN:-}
       MA_ENTITY: ${MA_ENTITY:-}
+      AUDD_TOKEN: ${AUDD_TOKEN:-}

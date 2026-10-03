@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import io
 import logging
 import os
 import shlex
 import time
+import wave
 from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -55,6 +57,7 @@ class Settings:
     ma_url = os.getenv("MA_URL", "").rstrip("/")
     ma_token = os.getenv("MA_TOKEN", "")
     ma_entity = os.getenv("MA_ENTITY", "")
+    audd_token = os.getenv("AUDD_TOKEN", "")
 
 
 settings = Settings()
@@ -85,6 +88,7 @@ class PiCapture:
         self.last_data_at: float | None = None
         self.bytes_received = 0
         self.last_error = ""
+        self.recent_chunks: deque[bytes] = deque(maxlen=400)
         self.lock = asyncio.Lock()
 
     @property
@@ -127,6 +131,7 @@ class PiCapture:
                     break
                 self.last_data_at = time.time()
                 self.bytes_received += len(data)
+                self.recent_chunks.append(data)
                 for subscriber in list(self.subscribers):
                     if not subscriber.full():
                         subscriber.put_nowait(data)
@@ -201,9 +206,20 @@ class PiCapture:
             "last_error": self.last_error,
         }
 
+    def recent_wav(self) -> bytes:
+        pcm = b"".join(self.recent_chunks)
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav_file:
+            wav_file.setnchannels(settings.channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(settings.sample_rate)
+            wav_file.writeframes(pcm)
+        return output.getvalue()
+
 
 capture = PiCapture()
 sendspin_process: asyncio.subprocess.Process | None = None
+now_playing: dict[str, str] = {"title": "", "artist": "", "album": "", "source": "manual"}
 
 
 async def start_sendspin() -> None:
@@ -296,6 +312,7 @@ async def api_status() -> JSONResponse:
     return JSONResponse(
         {
             "capture": capture.status(),
+            "now_playing": now_playing,
             "music_assistant": await music_assistant(),
             "sendspin": {
                 "port": settings.sendspin_port,
@@ -303,6 +320,65 @@ async def api_status() -> JSONResponse:
             },
         }
     )
+
+
+@app.post("/api/metadata")
+async def set_metadata(payload: dict[str, Any]) -> JSONResponse:
+    now_playing.update(
+        {
+            "title": str(payload.get("title", "")).strip(),
+            "artist": str(payload.get("artist", "")).strip(),
+            "album": str(payload.get("album", "")).strip(),
+            "source": "manual",
+        }
+    )
+    log.info("Manual metadata set: %s - %s", now_playing["artist"], now_playing["title"])
+    return JSONResponse({"ok": True, "now_playing": now_playing})
+
+
+@app.delete("/api/metadata")
+async def clear_metadata() -> JSONResponse:
+    now_playing.update({"title": "", "artist": "", "album": "", "source": "manual"})
+    log.info("Now-playing metadata cleared")
+    return JSONResponse({"ok": True, "now_playing": now_playing})
+
+
+@app.post("/api/recognize")
+async def recognize_audio() -> JSONResponse:
+    if not settings.audd_token:
+        return JSONResponse(
+            {"ok": False, "error": "AUDD_TOKEN is not configured."}, status_code=400
+        )
+    audio = capture.recent_wav()
+    if len(audio) < settings.sample_rate * settings.channels * 2 * 5:
+        return JSONResponse(
+            {"ok": False, "error": "Not enough captured audio yet. Start playback and try again."},
+            status_code=400,
+        )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.audd.io/",
+                data={"api_token": settings.audd_token, "return": "apple_music,spotify"},
+                files={"file": ("turntable.wav", audio, "audio/wav")},
+            )
+            response.raise_for_status()
+            result = response.json().get("result") or {}
+        if not result:
+            return JSONResponse({"ok": False, "error": "No matching song was found."}, status_code=404)
+        now_playing.update(
+            {
+                "title": str(result.get("title", "")),
+                "artist": str(result.get("artist", "")),
+                "album": str(result.get("album", "")),
+                "source": "AudD recognition",
+            }
+        )
+        log.info("Recognized metadata: %s - %s", now_playing["artist"], now_playing["title"])
+        return JSONResponse({"ok": True, "now_playing": now_playing})
+    except Exception as exc:
+        log.exception("Audio recognition failed")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
 @app.get("/api/logs")
@@ -328,10 +404,10 @@ async def index() -> str:
 </style></head><body><main class="shell"><header class="top"><div class="brand"><div class="record"></div><div><div class="eyebrow">Live audio source</div><h1>{title}</h1></div></div><div class="pill"><i data-lucide="wifi" width="14"></i> <a href="#" onclick="window.open('http://' + location.hostname + ':{settings.sendspin_port}')" style="color:inherit;text-decoration:none">Open Sendspin :{settings.sendspin_port}</a></div></header>
 <section class="grid"><article class="panel hero"><div><div class="status"><span class="dot"></span> Control bridge online</div><h2>Your records, everywhere.</h2><p>USB audio enters through the Raspberry Pi, crosses the network securely, and arrives in Music Assistant as a synchronized source.</p></div><div class="actions"><button onclick="testPi()"><i data-lucide="scan-line" width="16"></i> Test Raspberry Pi</button><button class="secondary" onclick="refresh()"><i data-lucide="refresh-cw" width="16"></i> Refresh</button></div></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="disc-3" width="18"></i> Signal path</h3><div class="metric"><span>Raspberry Pi</span><strong id="pi">checking...</strong></div><div class="metric"><span>USB capture</span><strong id="device">checking...</strong></div><div class="metric"><span>Sendspin</span><strong id="sendspin">checking...</strong></div><div class="metric"><span>Audio</span><strong>{settings.sample_rate // 1000} kHz / {settings.channels} ch</strong></div></article>
-<article class="panel"><h3 class="section-title"><i data-lucide="music-2" width="18"></i> Music Assistant</h3><div class="now" id="song">Loading now playing...</div><div class="sub" id="artist"></div><p class="note" id="ma-note">The current player state appears here when Music Assistant is configured.</p></article>
+<article class="panel"><h3 class="section-title"><i data-lucide="music-2" width="18"></i> Now playing</h3><div class="now" id="song">No record selected</div><div class="sub" id="artist"></div><div style="display:grid;gap:8px;margin-top:18px"><input id="artist-input" placeholder="Artist" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="album-input" placeholder="Album" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="title-input" placeholder="Track" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"></div><div class="actions" style="margin-top:12px"><button onclick="setMetadata()"><i data-lucide="check" width="16"></i> Set metadata</button><button class="secondary" onclick="recognize()"><i data-lucide="scan-search" width="16"></i> Recognize</button></div><p class="note" id="metadata-note">Manual metadata stays local to this bridge. Recognition uses AudD when AUDD_TOKEN is configured.</p></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="wrench" width="18"></i> Diagnostics</h3><p class="note">The bridge uses the SSH key mounted from <code>/mnt/user/appdata/turntable/ssh</code>. Pi checks and capture errors appear in the log below.</p><pre id="logs">Loading logs...</pre></article>
 <article class="panel wide"><h3 class="section-title"><i data-lucide="activity" width="18"></i> System status</h3><div id="result" class="note">Ready.</div></article></section></main><script>
-lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/status');const d=await r.json();document.getElementById('pi').textContent=d.capture.pi;document.getElementById('device').textContent=d.capture.running?'Streaming':'Waiting';document.getElementById('sendspin').textContent=d.sendspin.running?'Listening':'Starting';const m=d.music_assistant;document.getElementById('song').textContent=m.title||'Nothing playing';document.getElementById('artist').textContent=[m.artist,m.album].filter(Boolean).join(' · ');document.getElementById('ma-note').textContent=m.error||(!m.configured?'Set MA_URL, MA_TOKEN and MA_ENTITY in the container template.':'Music Assistant status connected.');const l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.logs.join('\\n')||'No logs yet.';}}catch(e){{document.getElementById('result').textContent='Dashboard API unavailable: '+e}}}}async function testPi(){{document.getElementById('result').textContent='Testing SSH and listing ALSA devices...';const r=await fetch('/api/test-pi',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=(d.ok?'Pi connection OK\\n':'Pi test failed\\n')+d.output;refresh()}}refresh();setInterval(refresh,5000);
+lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/status');const d=await r.json();document.getElementById('pi').textContent=d.capture.pi;document.getElementById('device').textContent=d.capture.running?'Streaming':'Waiting';document.getElementById('sendspin').textContent=d.sendspin.running?'Listening':'Starting';const n=d.now_playing;document.getElementById('song').textContent=n.title||'No record selected';document.getElementById('artist').textContent=[n.artist,n.album].filter(Boolean).join(' · ')||n.source;document.getElementById('artist-input').value=n.artist;document.getElementById('album-input').value=n.album;document.getElementById('title-input').value=n.title;const l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.logs.join('\\n')||'No logs yet.';}}catch(e){{document.getElementById('result').textContent='Dashboard API unavailable: '+e}}}}async function setMetadata(){{const payload={{artist:document.getElementById('artist-input').value,album:document.getElementById('album-input').value,title:document.getElementById('title-input').value}};const r=await fetch('/api/metadata',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Metadata saved for this record.':d.error||'Could not save metadata.';refresh()}}async function recognize(){{document.getElementById('metadata-note').textContent='Listening for a match...';const r=await fetch('/api/recognize',{{method:'POST'}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Recognition result saved.':d.error||'Recognition failed.';refresh()}}async function testPi(){{document.getElementById('result').textContent='Testing SSH and listing ALSA devices...';const r=await fetch('/api/test-pi',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=(d.ok?'Pi connection OK\\n':'Pi test failed\\n')+d.output;refresh()}}refresh();setInterval(refresh,5000);
 </script></body></html>'''
 
 
