@@ -4,10 +4,12 @@ A small Unraid control plane for a USB turntable preamp connected to a Raspberry
 
 ## Unraid deployment
 
-1. Build the image with `docker compose build`.
+The GitHub Actions workflow publishes the image as `ghcr.io/jordancollins1/turntable-sendspin:latest` whenever `master` changes. In Unraid, use **Docker -> Add Container** and enter that image name, then add the ports, SSH volume, and environment variables below. For a local build instead, use `docker compose build`.
+
+1. Add ports `8383:8383` and `8927:8927`.
 2. Copy `.env.example` to `.env` and set the Pi and Music Assistant values.
 3. Mount `/mnt/user/appdata/turntable/ssh` into `/config/ssh` read-only. Place the SSH private key at `id_rsa`.
-4. Start it with `docker compose up -d`.
+4. Start the container.
 5. Open `http://UNRAID_IP:8383` and use **Test Raspberry Pi**.
 6. Open the Sendspin pairing portal from the dashboard or at `http://UNRAID_IP:8927`.
 
