@@ -1,0 +1,21 @@
+services:
+  turntable:
+    build: .
+    image: turntable-sendspin:latest
+    container_name: turntable-sendspin
+    restart: unless-stopped
+    ports:
+      - "8383:8383"
+      - "8927:8927"
+    volumes:
+      - /mnt/user/appdata/turntable/ssh:/config/ssh:ro
+    environment:
+      TURNTABLE_NAME: ${TURNTABLE_NAME:-Turntable}
+      PI_HOST: ${PI_HOST:-raspberrypi.local}
+      PI_USER: ${PI_USER:-pi}
+      PI_AUDIO_DEVICE: ${PI_AUDIO_DEVICE:-plughw:CARD=Device,DEV=0}
+      AUDIO_RATE: ${AUDIO_RATE:-48000}
+      AUDIO_CHANNELS: ${AUDIO_CHANNELS:-2}
+      MA_URL: ${MA_URL:-}
+      MA_TOKEN: ${MA_TOKEN:-}
+      MA_ENTITY: ${MA_ENTITY:-}
