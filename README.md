@@ -21,4 +21,4 @@ The dashboard supports manual artist, album, and track entry. This metadata is k
 
 The bridge is a Sendspin `source@v1` client, not a Sendspin Party server. After pairing, the turntable appears under Music Assistant **Live Inputs**.
 
-Recognition is optional. Set `AUDD_TOKEN` in `.env` to enable the **Recognize** button. It sends a short rolling WAV sample to AudD, then fills the metadata fields when a match is found. Shazam does not provide a supported server-side API suitable for this container, so AudD is used as the pluggable recognition provider.
+Recognition is automatic when `AUDD_TOKEN` is set. The bridge checks the rolling audio buffer every 30 seconds by default and fills the metadata fields when a match is found. Change `RECOGNITION_INTERVAL` or set `AUTO_RECOGNIZE=false` in `.env` to adjust this. The **Recognize** button remains available for an immediate retry. Shazam does not provide a supported server-side API suitable for this container, so AudD is used as the pluggable recognition provider.

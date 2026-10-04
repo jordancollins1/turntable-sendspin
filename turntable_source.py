@@ -68,6 +68,8 @@ class Settings:
     sendspin_pairing_code = os.getenv("SENDSPIN_PAIRING_CODE", "")
     pairing_file = os.getenv("SENDSPIN_PAIRING_FILE", "/config/sendspin/pairing.json")
     identity_file = os.getenv("SENDSPIN_IDENTITY_FILE", "/config/sendspin/identity")
+    auto_recognize = os.getenv("AUTO_RECOGNIZE", "true").lower() in {"1", "true", "yes", "on"}
+    recognition_interval = int(os.getenv("RECOGNITION_INTERVAL", "30"))
 
 
 settings = Settings()
@@ -230,6 +232,8 @@ class PiCapture:
 capture = PiCapture()
 now_playing: dict[str, str] = {"title": "", "artist": "", "album": "", "source": "manual"}
 pairing_code = ""
+recognition_task: asyncio.Task[None] | None = None
+last_recognition_key = ""
 
 
 def load_identity() -> Identity:
@@ -451,18 +455,13 @@ async def clear_metadata() -> JSONResponse:
     return JSONResponse({"ok": True, "now_playing": now_playing})
 
 
-@app.post("/api/recognize")
-async def recognize_audio() -> JSONResponse:
+async def recognize_latest() -> dict[str, Any]:
+    global last_recognition_key
     if not settings.audd_token:
-        return JSONResponse(
-            {"ok": False, "error": "AUDD_TOKEN is not configured."}, status_code=400
-        )
+        return {"ok": False, "error": "AUDD_TOKEN is not configured."}
     audio = capture.recent_wav()
     if len(audio) < settings.sample_rate * settings.channels * 2 * 5:
-        return JSONResponse(
-            {"ok": False, "error": "Not enough captured audio yet. Start playback and try again."},
-            status_code=400,
-        )
+        return {"ok": False, "error": "Not enough captured audio yet."}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -473,7 +472,11 @@ async def recognize_audio() -> JSONResponse:
             response.raise_for_status()
             result = response.json().get("result") or {}
         if not result:
-            return JSONResponse({"ok": False, "error": "No matching song was found."}, status_code=404)
+            return {"ok": False, "error": "No matching song was found."}
+        match_key = f"{result.get('artist', '')}|{result.get('title', '')}|{result.get('album', '')}"
+        if match_key == last_recognition_key:
+            return {"ok": True, "duplicate": True, "now_playing": now_playing}
+        last_recognition_key = match_key
         now_playing.update(
             {
                 "title": str(result.get("title", "")),
@@ -483,10 +486,27 @@ async def recognize_audio() -> JSONResponse:
             }
         )
         log.info("Recognized metadata: %s - %s", now_playing["artist"], now_playing["title"])
-        return JSONResponse({"ok": True, "now_playing": now_playing})
+        return {"ok": True, "now_playing": now_playing}
     except Exception as exc:
         log.exception("Audio recognition failed")
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/recognize")
+async def recognize_audio() -> JSONResponse:
+    result = await recognize_latest()
+    status = 200 if result.get("ok") else 502
+    return JSONResponse(result, status_code=status)
+
+
+async def auto_recognize_loop() -> None:
+    while True:
+        await asyncio.sleep(max(10, settings.recognition_interval))
+        if not settings.auto_recognize or not settings.audd_token or not capture.running:
+            continue
+        result = await recognize_latest()
+        if result.get("ok") and not result.get("duplicate"):
+            log.info("Automatic recognition updated the current record")
 
 
 @app.get("/api/logs")
@@ -528,12 +548,18 @@ lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/st
 
 
 async def main() -> None:
+    global recognition_task
     await source_bridge.start()
+    recognition_task = asyncio.create_task(auto_recognize_loop())
     config = uvicorn.Config(app, host="0.0.0.0", port=settings.web_port, log_level="warning")
     server = uvicorn.Server(config)
     try:
         await server.serve()
     finally:
+        if recognition_task and not recognition_task.done():
+            recognition_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recognition_task
         await source_bridge.stop()
 
 
