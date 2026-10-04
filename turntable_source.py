@@ -70,6 +70,8 @@ class Settings:
     identity_file = os.getenv("SENDSPIN_IDENTITY_FILE", "/config/sendspin/identity")
     auto_recognize = os.getenv("AUTO_RECOGNIZE", "true").lower() in {"1", "true", "yes", "on"}
     recognition_interval = int(os.getenv("RECOGNITION_INTERVAL", "30"))
+    capture_chunk_ms = int(os.getenv("CAPTURE_CHUNK_MS", "100"))
+    capture_buffer_ms = int(os.getenv("CAPTURE_BUFFER_MS", "400"))
 
 
 settings = Settings()
@@ -333,9 +335,27 @@ class SendspinSourceBridge:
 
     async def _feed_capture(self) -> None:
         assert self.source_capture is not None
+        frame_bytes = settings.channels * 2
+        chunk_bytes = settings.sample_rate * frame_bytes * settings.capture_chunk_ms // 1000
+        prebuffer_chunks = max(1, settings.capture_buffer_ms // settings.capture_chunk_ms)
+        pending = bytearray()
+        buffered: list[bytes] = []
         try:
             async for data in capture.stream():
-                await self.source_capture.feed(data, capture_timestamp_us=time.monotonic_ns() // 1000)
+                pending.extend(data)
+                while len(pending) >= chunk_bytes:
+                    chunk = bytes(pending[:chunk_bytes])
+                    del pending[:chunk_bytes]
+                    if len(buffered) < prebuffer_chunks:
+                        buffered.append(chunk)
+                        if len(buffered) < prebuffer_chunks:
+                            continue
+                    else:
+                        buffered.append(chunk)
+                    next_chunk = buffered.pop(0)
+                    duration_us = len(next_chunk) * 1_000_000 // (settings.sample_rate * frame_bytes)
+                    capture_timestamp_us = time.monotonic_ns() // 1000 - duration_us
+                    await self.source_capture.feed(next_chunk, capture_timestamp_us=capture_timestamp_us)
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -21,4 +21,6 @@ The dashboard supports manual artist, album, and track entry. This metadata is k
 
 The bridge is a Sendspin `source@v1` client, not a Sendspin Party server. After pairing, the turntable appears under Music Assistant **Live Inputs**.
 
+The default capture settings use 100 ms packets and a 400 ms jitter buffer to smooth Raspberry Pi Wi-Fi/SSH timing. Increase `CAPTURE_BUFFER_MS` to 600 or 800 if the Pi network is still unstable; this adds latency but does not change pitch or quality.
+
 Recognition is automatic when `AUDD_TOKEN` is set. The bridge checks the rolling audio buffer every 30 seconds by default and fills the metadata fields when a match is found. Change `RECOGNITION_INTERVAL` or set `AUTO_RECOGNIZE=false` in `.env` to adjust this. The **Recognize** button remains available for an immediate retry. Shazam does not provide a supported server-side API suitable for this container, so AudD is used as the pluggable recognition provider.
