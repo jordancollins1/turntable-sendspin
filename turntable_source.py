@@ -280,8 +280,8 @@ class SendspinSourceBridge:
             roles=[Roles.SOURCE],
             pairing_store=self.pairing_store,
             pairing_support=PairingSupport(
-                pairing_code_display=self._show_pairing_code,
-                offer_static_pairing_code=bool(settings.sendspin_pairing_code),
+                pin_display=self._show_pairing_code,
+                offer_static_pin=bool(settings.sendspin_pairing_code),
             ),
             source_support=ClientHelloSourceSupport(
                 features=ClientHelloSourceFeatures(line_sense=False)
@@ -294,9 +294,9 @@ class SendspinSourceBridge:
             await self._stop_capture()
             self.client = None
 
-    async def _show_pairing_code(self, code: str | None, *, grouped: str | None) -> None:
+    async def _show_pairing_code(self, code: str | None) -> None:
         global pairing_code
-        pairing_code = grouped or code or ""
+        pairing_code = code or ""
         if pairing_code:
             log.info("Sendspin pairing code: %s", pairing_code)
         else:
