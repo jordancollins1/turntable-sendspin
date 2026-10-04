@@ -9,9 +9,10 @@ The GitHub Actions workflow publishes the image as `ghcr.io/jordancollins1/turnt
 1. Add ports `8383:8383` and `8928:8928`.
 2. Copy `.env.example` to `.env` and set the Pi and Music Assistant values.
 3. Mount `/mnt/user/appdata/turntable/ssh` into `/config/ssh` read-only. Place the SSH private key at `id_rsa`.
-4. Start the container.
-5. Open `http://UNRAID_IP:8383` and use **Test Raspberry Pi**.
-6. Click **Open pairing**, then pair the discovered source from Music Assistant's **Sendspin Source** provider.
+4. Mount `/mnt/user/appdata/turntable/sendspin` into `/config/sendspin` read-write. This preserves the Sendspin identity and pairing records.
+5. Start the container.
+6. Open `http://UNRAID_IP:8383` and use **Test Raspberry Pi**.
+7. Click **Open pairing**, then pair the discovered source from Music Assistant's **Sendspin Source** provider.
 
 Do not commit `.env`, SSH keys, or Music Assistant tokens. See `TURNtable_UNRAID.md` for the full setup and troubleshooting guide.
 

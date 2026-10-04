@@ -9,6 +9,7 @@ services:
       - "8928:8928"
     volumes:
       - /mnt/user/appdata/turntable/ssh:/config/ssh:ro
+      - /mnt/user/appdata/turntable/sendspin:/config/sendspin
     environment:
       TURNTABLE_NAME: ${TURNTABLE_NAME:-Turntable}
       PI_HOST: ${PI_HOST:-raspberrypi.local}

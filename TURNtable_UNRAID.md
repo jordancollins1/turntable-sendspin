@@ -21,9 +21,12 @@ Add a read-only path mapping:
 
 ```text
 /mnt/user/appdata/turntable/ssh:/config/ssh:ro
+/mnt/user/appdata/turntable/sendspin:/config/sendspin
 ```
 
 The mounted folder should contain the private key used by the old SSH setup, normally `id_rsa`. Add `known_hosts` there if you want strict host-key verification; otherwise the bridge uses `accept-new` for the first connection.
+
+The `sendspin` folder must be read-write. It stores the persistent Sendspin identity and pairing records so the source does not need to be paired again after an update or restart.
 
 Recommended environment variables:
 
