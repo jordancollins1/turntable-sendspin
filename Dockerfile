@@ -11,8 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY turntable_source.py .
 
-RUN mkdir -p /config/ssh
+RUN mkdir -p /config/ssh /config/sendspin
 
-EXPOSE 8927 8383
+EXPOSE 8928 8383
 
 ENTRYPOINT ["python3", "turntable_source.py"]

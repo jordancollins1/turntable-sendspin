@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     ports:
       - "8383:8383"
-      - "8927:8927"
+      - "8928:8928"
     volumes:
       - /mnt/user/appdata/turntable/ssh:/config/ssh:ro
     environment:
@@ -20,3 +20,4 @@ services:
       MA_TOKEN: ${MA_TOKEN:-}
       MA_ENTITY: ${MA_ENTITY:-}
       AUDD_TOKEN: ${AUDD_TOKEN:-}
+      SENDSPIN_PAIRING_CODE: ${SENDSPIN_PAIRING_CODE:-}

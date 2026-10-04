@@ -3,12 +3,13 @@
 
 The Raspberry Pi owns the USB audio device. This service reads its raw ALSA
 capture stream over SSH, exposes it as a live WAV stream, and lets the
-official Sendspin CLI serve it to paired Music Assistant players.
+Sendspin source role and Music Assistant.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import html
 import io
@@ -21,6 +22,12 @@ from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from aiosendspin.client import ClientListener, PairingSupport, SendspinClient
+from aiosendspin.models.source import ClientHelloSourceFeatures, ClientHelloSourceSupport
+from aiosendspin.models.player import SupportedAudioFormat
+from aiosendspin.models.types import AudioCodec, Roles
+from aiosendspin.noise import Identity
+from aiosendspin.noise.trust_store import FileClientPairingStore
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -46,7 +53,7 @@ logging.getLogger().addHandler(memory_handler)
 class Settings:
     name = os.getenv("TURNTABLE_NAME", "Turntable")
     web_port = int(os.getenv("WEB_PORT", "8383"))
-    sendspin_port = int(os.getenv("SENDSPIN_PORT", "8927"))
+    sendspin_port = int(os.getenv("SENDSPIN_PORT", "8928"))
     pi_host = os.getenv("PI_HOST", "raspberrypi.local")
     pi_user = os.getenv("PI_USER", "pi")
     pi_audio_device = os.getenv("PI_AUDIO_DEVICE", "plughw:CARD=Device,DEV=0")
@@ -58,6 +65,9 @@ class Settings:
     ma_token = os.getenv("MA_TOKEN", "")
     ma_entity = os.getenv("MA_ENTITY", "")
     audd_token = os.getenv("AUDD_TOKEN", "")
+    sendspin_pairing_code = os.getenv("SENDSPIN_PAIRING_CODE", "")
+    pairing_file = os.getenv("SENDSPIN_PAIRING_FILE", "/config/sendspin/pairing.json")
+    identity_file = os.getenv("SENDSPIN_IDENTITY_FILE", "/config/sendspin/identity")
 
 
 settings = Settings()
@@ -218,38 +228,134 @@ class PiCapture:
 
 
 capture = PiCapture()
-sendspin_process: asyncio.subprocess.Process | None = None
 now_playing: dict[str, str] = {"title": "", "artist": "", "album": "", "source": "manual"}
+pairing_code = ""
 
 
-async def start_sendspin() -> None:
-    global sendspin_process
-    if sendspin_process and sendspin_process.returncode is None:
-        return
-    command = [
-        "sendspin",
-        "serve",
-        f"http://127.0.0.1:{settings.web_port}/audio.wav",
-        "--source-format",
-        "wav",
-        "--name",
-        settings.name,
-        "--port",
-        str(settings.sendspin_port),
-    ]
-    log.info("Starting Sendspin server on port %d", settings.sendspin_port)
-    sendspin_process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+def load_identity() -> Identity:
+    path = Path(settings.identity_file)
+    if path.exists():
+        return Identity.from_private_bytes(base64.urlsafe_b64decode(path.read_text().strip() + "=="))
+    identity = Identity.generate()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(identity.private_b64u, encoding="ascii")
+    path.chmod(0o600)
+    return identity
 
 
-async def read_sendspin_logs() -> None:
-    if not sendspin_process or not sendspin_process.stdout:
-        return
-    while data := await sendspin_process.stdout.readline():
-        log.info("Sendspin: %s", data.decode(errors="replace").strip())
+class SendspinSourceBridge:
+    def __init__(self) -> None:
+        self.client: SendspinClient | None = None
+        self.listener: ClientListener | None = None
+        self.capture_task: asyncio.Task[None] | None = None
+        self.source_capture: Any = None
+        self.pairing_store: FileClientPairingStore | None = None
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.client and self.client.connected)
+
+    async def start(self) -> None:
+        self.pairing_store = await FileClientPairingStore.open(settings.pairing_file)
+        if settings.sendspin_pairing_code:
+            await self.pairing_store.set_static_pairing_code(settings.sendspin_pairing_code)
+        self.listener = ClientListener(
+            client_id=load_identity().peer_id,
+            on_connection=self._handle_connection,
+            port=settings.sendspin_port,
+            client_name=settings.name,
+        )
+        await self.listener.start()
+        log.info("Sendspin source client advertising on port %d", settings.sendspin_port)
+
+    async def _handle_connection(self, websocket: Any) -> None:
+        assert self.pairing_store is not None
+        client = SendspinClient(
+            identity=load_identity(),
+            client_name=settings.name,
+            roles=[Roles.SOURCE],
+            pairing_store=self.pairing_store,
+            pairing_support=PairingSupport(
+                pairing_code_display=self._show_pairing_code,
+                offer_static_pairing_code=bool(settings.sendspin_pairing_code),
+            ),
+            source_support=ClientHelloSourceSupport(
+                features=ClientHelloSourceFeatures(line_sense=False)
+            ),
+        )
+        client.add_server_command_listener(self._server_command)
+        self.client = client
+        await client.attach_websocket(websocket)
+        if self.client is client:
+            await self._stop_capture()
+            self.client = None
+
+    async def _show_pairing_code(self, code: str | None, *, grouped: str | None) -> None:
+        global pairing_code
+        pairing_code = grouped or code or ""
+        if pairing_code:
+            log.info("Sendspin pairing code: %s", pairing_code)
+        else:
+            log.info("Sendspin pairing ended")
+
+    def _server_command(self, payload: Any) -> None:
+        source = getattr(payload, "source", None)
+        if source is None:
+            return
+        asyncio.create_task(self._handle_source_command(source.command))
+
+    async def _handle_source_command(self, command: str) -> None:
+        if command == "start":
+            await self._start_capture()
+        elif command == "stop":
+            await self._stop_capture()
+
+    async def _start_capture(self) -> None:
+        if self.capture_task and not self.capture_task.done():
+            return
+        if not self.client or not self.client.connected:
+            return
+        self.source_capture = self.client.create_source_capture(
+            SupportedAudioFormat(
+                codec=AudioCodec.PCM,
+                sample_rate=settings.sample_rate,
+                bit_depth=16,
+                channels=settings.channels,
+            )
+        )
+        await self.source_capture.start()
+        self.capture_task = asyncio.create_task(self._feed_capture())
+        log.info("Music Assistant requested turntable audio")
+
+    async def _feed_capture(self) -> None:
+        assert self.source_capture is not None
+        try:
+            async for data in capture.stream():
+                await self.source_capture.feed(data, capture_timestamp_us=time.monotonic_ns() // 1000)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Sendspin source capture failed")
+
+    async def _stop_capture(self) -> None:
+        if self.capture_task and not self.capture_task.done():
+            self.capture_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.capture_task
+        self.capture_task = None
+        if self.source_capture is not None:
+            with contextlib.suppress(Exception):
+                await self.source_capture.stop()
+        self.source_capture = None
+        await capture.stop()
+
+    async def stop(self) -> None:
+        await self._stop_capture()
+        if self.client:
+            with contextlib.suppress(Exception):
+                await self.client.disconnect()
+        if self.listener:
+            await self.listener.stop()
 
 
 async def music_assistant() -> dict[str, Any]:
@@ -294,6 +400,7 @@ def wav_header() -> bytes:
 
 
 app = FastAPI(title=f"{settings.name} Control")
+source_bridge = SendspinSourceBridge()
 
 
 @app.get("/audio.wav")
@@ -313,10 +420,11 @@ async def api_status() -> JSONResponse:
         {
             "capture": capture.status(),
             "now_playing": now_playing,
+            "pairing_code": pairing_code,
             "music_assistant": await music_assistant(),
             "sendspin": {
                 "port": settings.sendspin_port,
-                "running": bool(sendspin_process and sendspin_process.returncode is None),
+                "running": source_bridge.connected,
             },
         }
     )
@@ -391,6 +499,14 @@ async def test_pi() -> JSONResponse:
     return JSONResponse(await capture.test())
 
 
+@app.post("/api/pairing/open")
+async def open_pairing() -> JSONResponse:
+    if not source_bridge.client:
+        return JSONResponse({"ok": False, "error": "Music Assistant has not connected yet."}, status_code=409)
+    source_bridge.client.open_pairing_window()
+    return JSONResponse({"ok": True, "message": "Pairing window opened. Start pairing from Music Assistant."})
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     title = html.escape(settings.name)
@@ -401,28 +517,24 @@ async def index() -> str:
 :root{{--ink:#f8f5ef;--muted:#a9a59d;--panel:#17191b;--panel2:#202326;--line:#303438;--accent:#e9b44c;--green:#75d69a;--red:#ef7770}}
 *{{box-sizing:border-box}}body{{margin:0;background:#0e1011;color:var(--ink);font:15px ui-sans-serif,system-ui,sans-serif;background-image:radial-gradient(circle at 80% -20%,#4a3520 0,transparent 34%),linear-gradient(135deg,#0e1011,#151719 60%,#11100e)}}
 .shell{{max-width:1180px;margin:auto;padding:38px 24px 56px}}.top{{display:flex;align-items:center;justify-content:space-between;margin-bottom:34px}}.brand{{display:flex;gap:14px;align-items:center}}.record{{width:46px;height:46px;border-radius:50%;background:radial-gradient(circle,#e9b44c 0 8%,#17191b 9% 16%,#414448 17% 18%,#111 19% 100%);box-shadow:0 0 0 7px #202326}}h1{{font:600 29px Georgia,serif;margin:0}}.eyebrow{{color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:.16em;margin-bottom:5px}}.pill{{border:1px solid var(--line);padding:8px 12px;border-radius:99px;color:var(--muted);font-size:12px}}.grid{{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}}.panel{{background:linear-gradient(145deg,#1a1c1f,#141618);border:1px solid var(--line);border-radius:12px;padding:24px;box-shadow:0 14px 40px #0004}}.hero{{min-height:290px;display:flex;flex-direction:column;justify-content:space-between}}.hero h2{{font:500 42px Georgia,serif;max-width:580px;margin:20px 0 10px;line-height:1.05}}.hero p{{color:var(--muted);max-width:580px;line-height:1.6}}.status{{display:flex;align-items:center;gap:9px;color:var(--green);font-size:13px}}.dot{{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 13px var(--green)}}.section-title{{display:flex;align-items:center;gap:10px;font-weight:600;margin:0 0 18px}}.section-title i{{color:var(--accent)}}.metric{{display:flex;justify-content:space-between;padding:13px 0;border-bottom:1px solid var(--line);color:var(--muted)}}.metric strong{{color:var(--ink);font-weight:500;text-align:right;max-width:60%;overflow:hidden;text-overflow:ellipsis}}button{{border:0;background:var(--accent);color:#17130b;padding:11px 16px;border-radius:7px;font-weight:700;cursor:pointer;display:inline-flex;gap:8px;align-items:center}}button.secondary{{background:#2a2d30;color:var(--ink);border:1px solid #3a3e42}}.actions{{display:flex;gap:10px;flex-wrap:wrap}}.now{{font:500 25px Georgia,serif;margin:4px 0 7px}}.sub{{color:var(--muted);min-height:22px}}pre{{white-space:pre-wrap;max-height:260px;overflow:auto;color:#b9c0bd;background:#0c0e0f;padding:15px;border-radius:7px;font-size:12px;line-height:1.55}}.wide{{grid-column:1/-1}}.note{{color:var(--muted);font-size:13px;line-height:1.5}}@media(max-width:800px){{.grid{{grid-template-columns:1fr}}.wide{{grid-column:auto}}.hero h2{{font-size:35px}}.top{{align-items:flex-start;gap:18px;flex-direction:column}}}}
-</style></head><body><main class="shell"><header class="top"><div class="brand"><div class="record"></div><div><div class="eyebrow">Live audio source</div><h1>{title}</h1></div></div><div class="pill"><i data-lucide="wifi" width="14"></i> <a href="#" onclick="window.open('http://' + location.hostname + ':{settings.sendspin_port}')" style="color:inherit;text-decoration:none">Open Sendspin :{settings.sendspin_port}</a></div></header>
-<section class="grid"><article class="panel hero"><div><div class="status"><span class="dot"></span> Control bridge online</div><h2>Your records, everywhere.</h2><p>USB audio enters through the Raspberry Pi, crosses the network securely, and arrives in Music Assistant as a synchronized source.</p></div><div class="actions"><button onclick="testPi()"><i data-lucide="scan-line" width="16"></i> Test Raspberry Pi</button><button class="secondary" onclick="refresh()"><i data-lucide="refresh-cw" width="16"></i> Refresh</button></div></article>
+ </style></head><body><main class="shell"><header class="top"><div class="brand"><div class="record"></div><div><div class="eyebrow">Live audio source</div><h1>{title}</h1></div></div><div class="pill"><i data-lucide="radio" width="14"></i> Source client :{settings.sendspin_port}</div></header>
+<section class="grid"><article class="panel hero"><div><div class="status"><span class="dot"></span> Control bridge online</div><h2>Your records, everywhere.</h2><p>USB audio enters through the Raspberry Pi, crosses the network securely, and arrives in Music Assistant as a synchronized source.</p></div><div class="actions"><button onclick="testPi()"><i data-lucide="scan-line" width="16"></i> Test Raspberry Pi</button><button onclick="openPairing()" class="secondary"><i data-lucide="key-round" width="16"></i> Open pairing</button><button class="secondary" onclick="refresh()"><i data-lucide="refresh-cw" width="16"></i> Refresh</button></div></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="disc-3" width="18"></i> Signal path</h3><div class="metric"><span>Raspberry Pi</span><strong id="pi">checking...</strong></div><div class="metric"><span>USB capture</span><strong id="device">checking...</strong></div><div class="metric"><span>Sendspin</span><strong id="sendspin">checking...</strong></div><div class="metric"><span>Audio</span><strong>{settings.sample_rate // 1000} kHz / {settings.channels} ch</strong></div></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="music-2" width="18"></i> Now playing</h3><div class="now" id="song">No record selected</div><div class="sub" id="artist"></div><div style="display:grid;gap:8px;margin-top:18px"><input id="artist-input" placeholder="Artist" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="album-input" placeholder="Album" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="title-input" placeholder="Track" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"></div><div class="actions" style="margin-top:12px"><button onclick="setMetadata()"><i data-lucide="check" width="16"></i> Set metadata</button><button class="secondary" onclick="recognize()"><i data-lucide="scan-search" width="16"></i> Recognize</button></div><p class="note" id="metadata-note">Manual metadata stays local to this bridge. Recognition uses AudD when AUDD_TOKEN is configured.</p></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="wrench" width="18"></i> Diagnostics</h3><p class="note">The bridge uses the SSH key mounted from <code>/mnt/user/appdata/turntable/ssh</code>. Pi checks and capture errors appear in the log below.</p><pre id="logs">Loading logs...</pre></article>
 <article class="panel wide"><h3 class="section-title"><i data-lucide="activity" width="18"></i> System status</h3><div id="result" class="note">Ready.</div></article></section></main><script>
-lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/status');const d=await r.json();document.getElementById('pi').textContent=d.capture.pi;document.getElementById('device').textContent=d.capture.running?'Streaming':'Waiting';document.getElementById('sendspin').textContent=d.sendspin.running?'Listening':'Starting';const n=d.now_playing;document.getElementById('song').textContent=n.title||'No record selected';document.getElementById('artist').textContent=[n.artist,n.album].filter(Boolean).join(' · ')||n.source;document.getElementById('artist-input').value=n.artist;document.getElementById('album-input').value=n.album;document.getElementById('title-input').value=n.title;const l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.logs.join('\\n')||'No logs yet.';}}catch(e){{document.getElementById('result').textContent='Dashboard API unavailable: '+e}}}}async function setMetadata(){{const payload={{artist:document.getElementById('artist-input').value,album:document.getElementById('album-input').value,title:document.getElementById('title-input').value}};const r=await fetch('/api/metadata',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Metadata saved for this record.':d.error||'Could not save metadata.';refresh()}}async function recognize(){{document.getElementById('metadata-note').textContent='Listening for a match...';const r=await fetch('/api/recognize',{{method:'POST'}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Recognition result saved.':d.error||'Recognition failed.';refresh()}}async function testPi(){{document.getElementById('result').textContent='Testing SSH and listing ALSA devices...';const r=await fetch('/api/test-pi',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=(d.ok?'Pi connection OK\\n':'Pi test failed\\n')+d.output;refresh()}}refresh();setInterval(refresh,5000);
+lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/status');const d=await r.json();document.getElementById('pi').textContent=d.capture.pi;document.getElementById('device').textContent=d.capture.running?'Streaming':'Waiting';document.getElementById('sendspin').textContent=d.sendspin.running?'Connected':'Waiting for Music Assistant';const n=d.now_playing;document.getElementById('song').textContent=n.title||'No record selected';document.getElementById('artist').textContent=[n.artist,n.album].filter(Boolean).join(' · ')||n.source;document.getElementById('artist-input').value=n.artist;document.getElementById('album-input').value=n.album;document.getElementById('title-input').value=n.title;const l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.logs.join('\\n')||'No logs yet.';}}catch(e){{document.getElementById('result').textContent='Dashboard API unavailable: '+e}}}}async function openPairing(){{const r=await fetch('/api/pairing/open',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=d.ok?d.message:d.error;refresh()}}async function setMetadata(){{const payload={{artist:document.getElementById('artist-input').value,album:document.getElementById('album-input').value,title:document.getElementById('title-input').value}};const r=await fetch('/api/metadata',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Metadata saved for this record.':d.error||'Could not save metadata.';refresh()}}async function recognize(){{document.getElementById('metadata-note').textContent='Listening for a match...';const r=await fetch('/api/recognize',{{method:'POST'}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Recognition result saved.':d.error||'Recognition failed.';refresh()}}async function testPi(){{document.getElementById('result').textContent='Testing SSH and listing ALSA devices...';const r=await fetch('/api/test-pi',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=(d.ok?'Pi connection OK\\n':'Pi test failed\\n')+d.output;refresh()}}refresh();setInterval(refresh,5000);
 </script></body></html>'''
 
 
 async def main() -> None:
-    await start_sendspin()
-    asyncio.create_task(read_sendspin_logs())
+    await source_bridge.start()
     config = uvicorn.Config(app, host="0.0.0.0", port=settings.web_port, log_level="warning")
     server = uvicorn.Server(config)
     try:
         await server.serve()
     finally:
-        await capture.stop()
-        if sendspin_process and sendspin_process.returncode is None:
-            sendspin_process.terminate()
-            await sendspin_process.wait()
+        await source_bridge.stop()
 
 
 if __name__ == "__main__":

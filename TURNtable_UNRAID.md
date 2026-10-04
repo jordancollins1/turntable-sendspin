@@ -1,6 +1,6 @@
 # Turntable Sendspin Bridge
 
-This container runs the control dashboard on Unraid. The USB audio device stays attached to the Raspberry Pi Zero W. Audio is captured on the Pi with ALSA over SSH, exposed as a live WAV stream, and served to Music Assistant through Sendspin.
+This container runs the control dashboard on Unraid. The USB audio device stays attached to the Raspberry Pi Zero W. Audio is captured on the Pi with ALSA over SSH and published to Music Assistant as a Sendspin source client.
 
 ## Build
 
@@ -15,7 +15,7 @@ docker build -t turntable-sendspin .
 Publish these ports:
 
 - `8383:8383` - control dashboard
-- `8927:8927` - Sendspin server and pairing portal
+- `8928:8928` - Sendspin source client connection
 
 Add a read-only path mapping:
 
@@ -36,7 +36,7 @@ AUDIO_RATE=48000
 AUDIO_CHANNELS=2
 SSH_KEY=/config/ssh/id_rsa
 WEB_PORT=8383
-SENDSPIN_PORT=8927
+SENDSPIN_PORT=8928
 ```
 
 For the Music Assistant card, configure the Home Assistant REST endpoint for the player that receives the turntable stream:
@@ -46,6 +46,7 @@ MA_URL=http://homeassistant:8123
 MA_TOKEN=<Home Assistant long-lived access token>
 MA_ENTITY=media_player.turntable
 AUDD_TOKEN=
+SENDSPIN_PAIRING_CODE=
 ```
 
 The token is only read from the container environment and is never shown in the dashboard. If Music Assistant is running standalone rather than through Home Assistant, leave these fields empty until its supported status API is selected.
@@ -56,9 +57,9 @@ The dashboard also has manual artist, album, and track fields. Use **Set metadat
 
 1. Open `http://UNRAID_HOST:8383`.
 2. Select **Test Raspberry Pi** and confirm the USB capture device appears in the output.
-3. Open **Open Sendspin** from the dashboard header on port `8927`.
-4. Pair the Music Assistant Sendspin player there.
-5. Start playback in Music Assistant. The dashboard will begin the SSH/ALSA capture when Sendspin requests audio.
+3. Click **Open pairing** in the dashboard.
+4. Add/enable Music Assistant's **Sendspin Source** provider and pair the discovered `Turntable` source.
+5. Start the source from Music Assistant under **Live Inputs**. The dashboard begins SSH/ALSA capture when Music Assistant requests audio.
 
 On the Pi, the capture command used by the bridge is equivalent to:
 
@@ -70,4 +71,4 @@ Run `arecord -l` over SSH if the device name differs. Set `PI_AUDIO_DEVICE` to t
 
 ## Notes
 
-The dashboard port is intentionally separate from Sendspin's port. The latter is the pairing and player portal provided by the official Sendspin CLI. Keep both ports on the LAN and do not expose them directly to the internet.
+The bridge advertises itself as a Sendspin source over mDNS. Keep both ports on the LAN and do not expose them directly to the internet.
