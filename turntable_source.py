@@ -72,6 +72,8 @@ class Settings:
     recognition_interval = int(os.getenv("RECOGNITION_INTERVAL", "30"))
     capture_chunk_ms = int(os.getenv("CAPTURE_CHUNK_MS", "100"))
     capture_buffer_ms = int(os.getenv("CAPTURE_BUFFER_MS", "400"))
+    arecord_buffer_us = int(os.getenv("ARECORD_BUFFER_US", "500000"))
+    arecord_period_us = int(os.getenv("ARECORD_PERIOD_US", "100000"))
 
 
 settings = Settings()
@@ -125,6 +127,10 @@ class PiCapture:
                 str(settings.channels),
                 "-t",
                 "raw",
+                "-B",
+                str(settings.arecord_buffer_us),
+                "-F",
+                str(settings.arecord_period_us),
             ]
             log.info("Starting Pi capture: %s", " ".join(shlex.quote(part) for part in command))
             self.process = await asyncio.create_subprocess_exec(
@@ -147,8 +153,7 @@ class PiCapture:
                 self.bytes_received += len(data)
                 self.recent_chunks.append(data)
                 for subscriber in list(self.subscribers):
-                    if not subscriber.full():
-                        subscriber.put_nowait(data)
+                    await subscriber.put(data)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -200,7 +205,7 @@ class PiCapture:
             result = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, stderr = await result.communicate()
             return {
