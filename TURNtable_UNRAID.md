@@ -4,7 +4,7 @@ This container runs the control dashboard on Unraid. The USB audio device stays 
 
 ## Build
 
-Build this folder as the Docker context because it contains the Dockerfile, requirements, and Python service:
+Build this folder as the Docker context because it contains the Dockerfile, requirements, and Python service (`turntable_source.py`). `requirements.txt` must include `shazamio` for song recognition:
 
 ```bash
 docker build -t turntable-sendspin .
@@ -34,7 +34,7 @@ Recommended environment variables:
 TURNTABLE_NAME=Turntable
 PI_HOST=raspberrypi.local
 PI_USER=pi
-PI_AUDIO_DEVICE=plughw:CARD=Device,DEV=0
+PI_AUDIO_DEVICE=plughw:CARD=Device,DEV=0   # use the card name from `arecord -l`, e.g. CARD=CODEC
 AUDIO_RATE=48000
 AUDIO_CHANNELS=2
 SSH_KEY=/config/ssh/id_rsa
@@ -48,9 +48,8 @@ For the Music Assistant card, configure the Home Assistant REST endpoint for the
 MA_URL=http://homeassistant:8123
 MA_TOKEN=<Home Assistant long-lived access token>
 MA_ENTITY=media_player.turntable
-AUDD_TOKEN=
 AUTO_RECOGNIZE=true
-RECOGNITION_INTERVAL=30
+RECOGNITION_INTERVAL=45
 CAPTURE_CHUNK_MS=100
 CAPTURE_BUFFER_MS=400
 ARECORD_BUFFER_US=500000
@@ -60,7 +59,7 @@ SENDSPIN_PAIRING_CODE=
 
 The token is only read from the container environment and is never shown in the dashboard. If Music Assistant is running standalone rather than through Home Assistant, leave these fields empty until its supported status API is selected.
 
-The dashboard recognizes audio automatically while Music Assistant is actively listening. Add an AudD API token as `AUDD_TOKEN`; recognition checks a short rolling audio sample every `RECOGNITION_INTERVAL` seconds. Set `AUTO_RECOGNIZE=false` to disable it. Manual metadata and the **Recognize** button remain available. Shazam does not offer a supported server-side API for this Docker workflow.
+The dashboard recognizes audio automatically while Music Assistant is actively listening. Recognition uses the free ShazamIO library and needs no API token: a rolling ~12 second sample is checked every `RECOGNITION_INTERVAL` seconds. Set `AUTO_RECOGNIZE=false` to disable it. Manual metadata and the **Recognize** button remain available. ShazamIO is unofficial and may break if Shazam changes its API.
 
 ## First run
 
@@ -76,8 +75,16 @@ On the Pi, the capture command used by the bridge is equivalent to:
 arecord -D plughw:CARD=Device,DEV=0 -f S16_LE -r 48000 -c 2 -t raw
 ```
 
-Run `arecord -l` over SSH if the device name differs. Set `PI_AUDIO_DEVICE` to the exact stable ALSA name.
+Run `arecord -l` over SSH if the device name differs. For example, `card 1: CODEC [USB AUDIO  CODEC]` means `PI_AUDIO_DEVICE=plughw:CARD=CODEC,DEV=0`. Set `PI_AUDIO_DEVICE` to the exact stable ALSA name.
 
 ## Notes
 
 The bridge advertises itself as a Sendspin source over mDNS. Keep both ports on the LAN and do not expose them directly to the internet.
+
+Because discovery uses mDNS, the container must be on the host network or a network with its own LAN IP (Unraid `br0`) for Music Assistant to find it. In the default bridge mode the advertised address is not reachable from the LAN.
+
+## Troubleshooting
+
+- **Test Raspberry Pi** shows the raw SSH and `arecord -l` output, including host-key and permission errors.
+- **"Waiting for Music Assistant":** check the network mode above, reload the Sendspin Source provider in Music Assistant, restart the container, and click **Open pairing**.
+- **Capture drops on the Pi Zero W:** keepalives detect a dead SSH link within about 15 seconds; turning off wifi power saving (`sudo iw dev wlan0 set power_save off`) usually helps.
