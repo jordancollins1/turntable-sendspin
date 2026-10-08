@@ -4,6 +4,10 @@ services:
     image: turntable-sendspin:latest
     container_name: turntable-sendspin
     restart: unless-stopped
+    # Sendspin discovery uses mDNS. If Music Assistant can't find the Turntable
+    # source, run the container on the host network (ports are then ignored)
+    # or give it its own LAN IP (e.g. an Unraid br0 custom network):
+    # network_mode: host
     ports:
       - "8383:8383"
       - "8928:8928"
@@ -20,9 +24,8 @@ services:
       MA_URL: ${MA_URL:-}
       MA_TOKEN: ${MA_TOKEN:-}
       MA_ENTITY: ${MA_ENTITY:-}
-      AUDD_TOKEN: ${AUDD_TOKEN:-}
       AUTO_RECOGNIZE: ${AUTO_RECOGNIZE:-true}
-      RECOGNITION_INTERVAL: ${RECOGNITION_INTERVAL:-30}
+      RECOGNITION_INTERVAL: ${RECOGNITION_INTERVAL:-45}
       CAPTURE_CHUNK_MS: ${CAPTURE_CHUNK_MS:-100}
       CAPTURE_BUFFER_MS: ${CAPTURE_BUFFER_MS:-400}
       ARECORD_BUFFER_US: ${ARECORD_BUFFER_US:-500000}
