@@ -3,7 +3,9 @@
 
 The Raspberry Pi owns the USB audio device. This service reads its raw ALSA
 capture stream over SSH, exposes it as a live WAV stream, and lets the
-Sendspin source role and Music Assistant.
+Sendspin source role feed it to Music Assistant.
+
+Song recognition uses ShazamIO (free, no API key): `pip install shazamio`.
 """
 
 from __future__ import annotations
@@ -32,6 +34,11 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
+
+try:
+    from shazamio import Shazam
+except ImportError:  # keep the bridge running even if recognition isn't installed
+    Shazam = None
 
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -64,12 +71,11 @@ class Settings:
     ma_url = os.getenv("MA_URL", "").rstrip("/")
     ma_token = os.getenv("MA_TOKEN", "")
     ma_entity = os.getenv("MA_ENTITY", "")
-    audd_token = os.getenv("AUDD_TOKEN", "")
     sendspin_pairing_code = os.getenv("SENDSPIN_PAIRING_CODE", "")
     pairing_file = os.getenv("SENDSPIN_PAIRING_FILE", "/config/sendspin/pairing.json")
     identity_file = os.getenv("SENDSPIN_IDENTITY_FILE", "/config/sendspin/identity")
     auto_recognize = os.getenv("AUTO_RECOGNIZE", "true").lower() in {"1", "true", "yes", "on"}
-    recognition_interval = int(os.getenv("RECOGNITION_INTERVAL", "30"))
+    recognition_interval = int(os.getenv("RECOGNITION_INTERVAL", "45"))
     capture_chunk_ms = int(os.getenv("CAPTURE_CHUNK_MS", "100"))
     capture_buffer_ms = int(os.getenv("CAPTURE_BUFFER_MS", "400"))
     arecord_buffer_us = int(os.getenv("ARECORD_BUFFER_US", "500000"))
@@ -88,12 +94,21 @@ def ssh_base() -> list[str]:
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
+        # Detect a dead connection (e.g. Pi wifi dropout) within ~15s instead of hanging.
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=3",
     ]
     if Path(settings.ssh_known_hosts).exists():
         command += ["-o", f"UserKnownHostsFile={settings.ssh_known_hosts}"]
     else:
         command += ["-o", "StrictHostKeyChecking=accept-new"]
     return command + [f"{settings.pi_user}@{settings.pi_host}"]
+
+
+# Lines arecord/ssh print on stderr during normal operation; not errors.
+BENIGN_STDERR_PREFIXES = ("Recording raw data", "Warning: Permanently added")
 
 
 class PiCapture:
@@ -104,7 +119,8 @@ class PiCapture:
         self.last_data_at: float | None = None
         self.bytes_received = 0
         self.last_error = ""
-        self.recent_chunks: deque[bytes] = deque(maxlen=400)
+        # ~12s of audio at 48kHz/16-bit/stereo (3840 bytes per chunk), enough for Shazam.
+        self.recent_chunks: deque[bytes] = deque(maxlen=640)
         self.lock = asyncio.Lock()
 
     @property
@@ -153,7 +169,11 @@ class PiCapture:
                 self.bytes_received += len(data)
                 self.recent_chunks.append(data)
                 for subscriber in list(self.subscribers):
-                    await subscriber.put(data)
+                    # Never let one slow consumer stall the capture reader.
+                    try:
+                        subscriber.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -167,9 +187,19 @@ class PiCapture:
             if process.stderr:
                 with contextlib.suppress(Exception):
                     stderr = await process.stderr.read()
-            if stderr:
-                self.last_error = stderr.decode(errors="replace").strip()[-500:]
+            real_errors = [
+                line
+                for line in stderr.decode(errors="replace").splitlines()
+                if line.strip() and not line.startswith(BENIGN_STDERR_PREFIXES)
+            ]
+            if real_errors:
+                self.last_error = "\n".join(real_errors)[-500:]
                 log.error("Pi capture stopped: %s", self.last_error)
+            elif process.returncode not in (0, -15):
+                self.last_error = f"arecord/ssh exited with code {process.returncode}"
+                log.error("Pi capture stopped: %s", self.last_error)
+            else:
+                log.info("Pi capture stopped")
             self.process = None
             for subscriber in list(self.subscribers):
                 with contextlib.suppress(asyncio.QueueFull):
@@ -205,13 +235,16 @@ class PiCapture:
             result = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                # Merge stderr into stdout so SSH errors are visible (and never None).
+                stderr=asyncio.subprocess.STDOUT,
             )
-            stdout, stderr = await result.communicate()
+            stdout, _ = await asyncio.wait_for(result.communicate(), timeout=20)
             return {
                 "ok": result.returncode == 0,
-                "output": (stdout + stderr).decode(errors="replace")[-4000:],
+                "output": (stdout or b"").decode(errors="replace")[-4000:],
             }
+        except asyncio.TimeoutError:
+            return {"ok": False, "output": "Timed out waiting for the Pi (20s)."}
         except Exception as exc:
             return {"ok": False, "output": str(exc)}
 
@@ -241,6 +274,7 @@ now_playing: dict[str, str] = {"title": "", "artist": "", "album": "", "source":
 pairing_code = ""
 recognition_task: asyncio.Task[None] | None = None
 last_recognition_key = ""
+shazam_client: Any = None
 
 
 def load_identity() -> Identity:
@@ -480,36 +514,43 @@ async def clear_metadata() -> JSONResponse:
     return JSONResponse({"ok": True, "now_playing": now_playing})
 
 
+def parse_shazam_result(result: dict[str, Any] | None) -> dict[str, str] | None:
+    """Pull title/artist/album out of a ShazamIO response, or None if no match."""
+    track = (result or {}).get("track")
+    if not track:
+        return None
+    album = ""
+    for section in track.get("sections", []) or []:
+        for item in section.get("metadata", []) or []:
+            if item.get("title") == "Album":
+                album = str(item.get("text", ""))
+    return {
+        "title": str(track.get("title", "")),
+        "artist": str(track.get("subtitle", "")),
+        "album": album,
+    }
+
+
 async def recognize_latest() -> dict[str, Any]:
-    global last_recognition_key
-    if not settings.audd_token:
-        return {"ok": False, "error": "AUDD_TOKEN is not configured."}
+    global last_recognition_key, shazam_client
+    if Shazam is None:
+        return {"ok": False, "error": "shazamio is not installed (pip install shazamio)."}
     audio = capture.recent_wav()
     if len(audio) < settings.sample_rate * settings.channels * 2 * 5:
         return {"ok": False, "error": "Not enough captured audio yet."}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                "https://api.audd.io/",
-                data={"api_token": settings.audd_token, "return": "apple_music,spotify"},
-                files={"file": ("turntable.wav", audio, "audio/wav")},
-            )
-            response.raise_for_status()
-            result = response.json().get("result") or {}
-        if not result:
+        if shazam_client is None:
+            shazam_client = Shazam()
+        recognize = getattr(shazam_client, "recognize", None) or shazam_client.recognize_song
+        result = await asyncio.wait_for(recognize(audio), timeout=30)
+        match = parse_shazam_result(result)
+        if not match:
             return {"ok": False, "error": "No matching song was found."}
-        match_key = f"{result.get('artist', '')}|{result.get('title', '')}|{result.get('album', '')}"
+        match_key = f"{match['artist']}|{match['title']}|{match['album']}"
         if match_key == last_recognition_key:
             return {"ok": True, "duplicate": True, "now_playing": now_playing}
         last_recognition_key = match_key
-        now_playing.update(
-            {
-                "title": str(result.get("title", "")),
-                "artist": str(result.get("artist", "")),
-                "album": str(result.get("album", "")),
-                "source": "AudD recognition",
-            }
-        )
+        now_playing.update({**match, "source": "Shazam recognition"})
         log.info("Recognized metadata: %s - %s", now_playing["artist"], now_playing["title"])
         return {"ok": True, "now_playing": now_playing}
     except Exception as exc:
@@ -526,8 +567,8 @@ async def recognize_audio() -> JSONResponse:
 
 async def auto_recognize_loop() -> None:
     while True:
-        await asyncio.sleep(max(10, settings.recognition_interval))
-        if not settings.auto_recognize or not settings.audd_token or not capture.running:
+        await asyncio.sleep(max(15, settings.recognition_interval))
+        if not settings.auto_recognize or Shazam is None or not capture.running:
             continue
         result = await recognize_latest()
         if result.get("ok") and not result.get("duplicate"):
@@ -570,15 +611,17 @@ async def index() -> str:
  </style></head><body><main class="shell"><header class="top"><div class="brand"><div class="record"></div><div><div class="eyebrow">Live audio source</div><h1>{title}</h1></div></div><div class="pill"><i data-lucide="radio" width="14"></i> Source client :{settings.sendspin_port}</div></header>
 <section class="grid"><article class="panel hero"><div><div class="status"><span class="dot"></span> Control bridge online</div><h2>Your records, everywhere.</h2><p>USB audio enters through the Raspberry Pi, crosses the network securely, and arrives in Music Assistant as a synchronized source.</p></div><div class="actions"><button onclick="testPi()"><i data-lucide="scan-line" width="16"></i> Test Raspberry Pi</button><button onclick="openPairing()" class="secondary"><i data-lucide="key-round" width="16"></i> Open pairing</button><button class="secondary" onclick="refresh()"><i data-lucide="refresh-cw" width="16"></i> Refresh</button></div></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="disc-3" width="18"></i> Signal path</h3><div class="metric"><span>Raspberry Pi</span><strong id="pi">checking...</strong></div><div class="metric"><span>USB capture</span><strong id="device">checking...</strong></div><div class="metric"><span>Sendspin</span><strong id="sendspin">checking...</strong></div><div class="metric"><span>Audio</span><strong>{settings.sample_rate // 1000} kHz / {settings.channels} ch</strong></div></article>
-<article class="panel"><h3 class="section-title"><i data-lucide="music-2" width="18"></i> Now playing</h3><div class="now" id="song">No record selected</div><div class="sub" id="artist"></div><div style="display:grid;gap:8px;margin-top:18px"><input id="artist-input" placeholder="Artist" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="album-input" placeholder="Album" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="title-input" placeholder="Track" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"></div><div class="actions" style="margin-top:12px"><button onclick="setMetadata()"><i data-lucide="check" width="16"></i> Set metadata</button><button class="secondary" onclick="recognize()"><i data-lucide="scan-search" width="16"></i> Recognize</button></div><p class="note" id="metadata-note">Manual metadata stays local to this bridge. Recognition uses AudD when AUDD_TOKEN is configured.</p></article>
+<article class="panel"><h3 class="section-title"><i data-lucide="music-2" width="18"></i> Now playing</h3><div class="now" id="song">No record selected</div><div class="sub" id="artist"></div><div style="display:grid;gap:8px;margin-top:18px"><input id="artist-input" placeholder="Artist" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="album-input" placeholder="Album" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"><input id="title-input" placeholder="Track" style="padding:10px;border-radius:6px;border:1px solid var(--line);background:#0c0e0f;color:var(--ink)"></div><div class="actions" style="margin-top:12px"><button onclick="setMetadata()"><i data-lucide="check" width="16"></i> Set metadata</button><button class="secondary" onclick="recognize()"><i data-lucide="scan-search" width="16"></i> Recognize</button></div><p class="note" id="metadata-note">Manual metadata stays local to this bridge. Recognition uses Shazam and needs no API key.</p></article>
 <article class="panel"><h3 class="section-title"><i data-lucide="wrench" width="18"></i> Diagnostics</h3><p class="note">The bridge uses the SSH key mounted from <code>/mnt/user/appdata/turntable/ssh</code>. Pi checks and capture errors appear in the log below.</p><pre id="logs">Loading logs...</pre></article>
 <article class="panel wide"><h3 class="section-title"><i data-lucide="activity" width="18"></i> System status</h3><div id="result" class="note">Ready.</div></article></section></main><script>
-lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/status');const d=await r.json();document.getElementById('pi').textContent=d.capture.pi;document.getElementById('device').textContent=d.capture.running?'Streaming':'Waiting';document.getElementById('sendspin').textContent=d.sendspin.running?'Connected':'Waiting for Music Assistant';const code=d.pairing_code||'Waiting...';document.getElementById('pairing-code').textContent=code;document.getElementById('pairing-message').textContent=d.pairing_code?'Enter this code in Music Assistant.':'Waiting for Music Assistant to begin pairing.';const n=d.now_playing;document.getElementById('song').textContent=n.title||'No record selected';document.getElementById('artist').textContent=[n.artist,n.album].filter(Boolean).join(' · ')||n.source;document.getElementById('artist-input').value=n.artist;document.getElementById('album-input').value=n.album;document.getElementById('title-input').value=n.title;const l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.logs.join('\\n')||'No logs yet.';}}catch(e){{document.getElementById('result').textContent='Dashboard API unavailable: '+e}}}}async function openPairing(){{document.getElementById('pairing-modal').style.display='flex';const r=await fetch('/api/pairing/open',{{method:'POST'}});const d=await r.json();document.getElementById('pairing-message').textContent=d.message||d.error||'Pairing is ready.';if(d.pairing_code)document.getElementById('pairing-code').textContent=d.pairing_code;refresh()}}function closePairing(){{document.getElementById('pairing-modal').style.display='none'}}async function setMetadata(){{const payload={{artist:document.getElementById('artist-input').value,album:document.getElementById('album-input').value,title:document.getElementById('title-input').value}};const r=await fetch('/api/metadata',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Metadata saved for this record.':d.error||'Could not save metadata.';refresh()}}async function recognize(){{document.getElementById('metadata-note').textContent='Listening for a match...';const r=await fetch('/api/recognize',{{method:'POST'}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Recognition result saved.':d.error||'Recognition failed.';refresh()}}async function testPi(){{document.getElementById('result').textContent='Testing SSH and listing ALSA devices...';const r=await fetch('/api/test-pi',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=(d.ok?'Pi connection OK\\n':'Pi test failed\\n')+d.output;refresh()}}refresh();setInterval(refresh,5000);
+if(window.lucide)lucide.createIcons();async function refresh(){{try{{const r=await fetch('/api/status');const d=await r.json();document.getElementById('pi').textContent=d.capture.pi;document.getElementById('device').textContent=d.capture.running?'Streaming':'Waiting';document.getElementById('sendspin').textContent=d.sendspin.running?'Connected':'Waiting for Music Assistant';const code=d.pairing_code||'Waiting...';document.getElementById('pairing-code').textContent=code;document.getElementById('pairing-message').textContent=d.pairing_code?'Enter this code in Music Assistant.':'Waiting for Music Assistant to begin pairing.';const n=d.now_playing;document.getElementById('song').textContent=n.title||'No record selected';document.getElementById('artist').textContent=[n.artist,n.album].filter(Boolean).join(' · ')||n.source;document.getElementById('artist-input').value=n.artist;document.getElementById('album-input').value=n.album;document.getElementById('title-input').value=n.title;const l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.logs.join('\\n')||'No logs yet.';}}catch(e){{document.getElementById('result').textContent='Dashboard API unavailable: '+e}}}}async function openPairing(){{document.getElementById('pairing-modal').style.display='flex';const r=await fetch('/api/pairing/open',{{method:'POST'}});const d=await r.json();document.getElementById('pairing-message').textContent=d.message||d.error||'Pairing is ready.';if(d.pairing_code)document.getElementById('pairing-code').textContent=d.pairing_code;refresh()}}function closePairing(){{document.getElementById('pairing-modal').style.display='none'}}async function setMetadata(){{const payload={{artist:document.getElementById('artist-input').value,album:document.getElementById('album-input').value,title:document.getElementById('title-input').value}};const r=await fetch('/api/metadata',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Metadata saved for this record.':d.error||'Could not save metadata.';refresh()}}async function recognize(){{document.getElementById('metadata-note').textContent='Listening for a match...';const r=await fetch('/api/recognize',{{method:'POST'}});const d=await r.json();document.getElementById('metadata-note').textContent=d.ok?'Recognition result saved.':d.error||'Recognition failed.';refresh()}}async function testPi(){{document.getElementById('result').textContent='Testing SSH and listing ALSA devices...';const r=await fetch('/api/test-pi',{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=(d.ok?'Pi connection OK\\n':'Pi test failed\\n')+d.output;refresh()}}refresh();setInterval(refresh,5000);
 </script><div id="pairing-modal" style="display:none;position:fixed;inset:0;background:#000b;z-index:10;align-items:center;justify-content:center;padding:24px"><div style="width:min(460px,100%);background:#1a1c1f;border:1px solid var(--accent);border-radius:14px;padding:30px;text-align:center;box-shadow:0 20px 80px #000"><div class="eyebrow">Sendspin source pairing</div><h2 style="font:500 34px Georgia,serif;margin:12px 0">Connect to Music Assistant</h2><p class="note">Open Music Assistant's Sendspin Source provider and select <strong style="color:var(--ink)">Turntable</strong>.</p><div id="pairing-code" style="font:700 44px ui-monospace,monospace;letter-spacing:.12em;color:var(--accent);margin:25px 0">Waiting...</div><p class="note" id="pairing-message">Waiting for the pairing code.</p><button class="secondary" onclick="closePairing()"><i data-lucide="x" width="16"></i> Close</button></div></div></body></html>'''
 
 
 async def main() -> None:
     global recognition_task
+    if Shazam is None:
+        log.warning("shazamio is not installed; song recognition is disabled (pip install shazamio)")
     await source_bridge.start()
     recognition_task = asyncio.create_task(auto_recognize_loop())
     config = uvicorn.Config(app, host="0.0.0.0", port=settings.web_port, log_level="warning")
