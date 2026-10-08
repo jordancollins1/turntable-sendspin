@@ -24,6 +24,8 @@ services:
       MA_URL: ${MA_URL:-}
       MA_TOKEN: ${MA_TOKEN:-}
       MA_ENTITY: ${MA_ENTITY:-}
+      HA_PUBLISH: ${HA_PUBLISH:-true}
+      HA_SENSOR: ${HA_SENSOR:-sensor.turntable_now_playing}
       AUTO_RECOGNIZE: ${AUTO_RECOGNIZE:-true}
       RECOGNITION_INTERVAL: ${RECOGNITION_INTERVAL:-45}
       CAPTURE_CHUNK_MS: ${CAPTURE_CHUNK_MS:-100}

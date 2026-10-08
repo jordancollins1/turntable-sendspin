@@ -71,6 +71,9 @@ class Settings:
     ma_url = os.getenv("MA_URL", "").rstrip("/")
     ma_token = os.getenv("MA_TOKEN", "")
     ma_entity = os.getenv("MA_ENTITY", "")
+    # Publish now-playing to Home Assistant as a sensor (uses MA_URL / MA_TOKEN).
+    ha_publish = os.getenv("HA_PUBLISH", "true").lower() in {"1", "true", "yes", "on"}
+    ha_sensor = os.getenv("HA_SENSOR", "sensor.turntable_now_playing")
     sendspin_pairing_code = os.getenv("SENDSPIN_PAIRING_CODE", "")
     pairing_file = os.getenv("SENDSPIN_PAIRING_FILE", "/config/sendspin/pairing.json")
     identity_file = os.getenv("SENDSPIN_IDENTITY_FILE", "/config/sendspin/identity")
@@ -169,11 +172,7 @@ class PiCapture:
                 self.bytes_received += len(data)
                 self.recent_chunks.append(data)
                 for subscriber in list(self.subscribers):
-                    # Never let one slow consumer stall the capture reader.
-                    try:
-                        subscriber.put_nowait(data)
-                    except asyncio.QueueFull:
-                        pass
+                    await subscriber.put(data)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -270,7 +269,7 @@ class PiCapture:
 
 
 capture = PiCapture()
-now_playing: dict[str, str] = {"title": "", "artist": "", "album": "", "source": "manual"}
+now_playing: dict[str, str] = {"title": "", "artist": "", "album": "", "art": "", "source": "manual"}
 pairing_code = ""
 recognition_task: asyncio.Task[None] | None = None
 last_recognition_key = ""
@@ -500,18 +499,58 @@ async def set_metadata(payload: dict[str, Any]) -> JSONResponse:
             "title": str(payload.get("title", "")).strip(),
             "artist": str(payload.get("artist", "")).strip(),
             "album": str(payload.get("album", "")).strip(),
+            "art": "",
             "source": "manual",
         }
     )
     log.info("Manual metadata set: %s - %s", now_playing["artist"], now_playing["title"])
+    await publish_to_home_assistant()
     return JSONResponse({"ok": True, "now_playing": now_playing})
 
 
 @app.delete("/api/metadata")
 async def clear_metadata() -> JSONResponse:
-    now_playing.update({"title": "", "artist": "", "album": "", "source": "manual"})
+    now_playing.update({"title": "", "artist": "", "album": "", "art": "", "source": "manual"})
     log.info("Now-playing metadata cleared")
+    await publish_to_home_assistant()
     return JSONResponse({"ok": True, "now_playing": now_playing})
+
+
+ha_last_error = ""
+
+
+async def publish_to_home_assistant() -> None:
+    """Mirror now_playing into a Home Assistant sensor via the REST states API."""
+    global ha_last_error
+    if not (settings.ha_publish and settings.ma_url and settings.ma_token):
+        return
+    payload = {
+        "state": (now_playing["title"] or "idle")[:255],
+        "attributes": {
+            "friendly_name": f"{settings.name} Now Playing",
+            "icon": "mdi:record-player",
+            "title": now_playing["title"],
+            "artist": now_playing["artist"],
+            "album": now_playing["album"],
+            "source": now_playing["source"],
+        },
+    }
+    if now_playing["art"]:
+        payload["attributes"]["entity_picture"] = now_playing["art"]
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            response = await client.post(
+                f"{settings.ma_url}/api/states/{settings.ha_sensor}",
+                headers={"Authorization": f"Bearer {settings.ma_token}"},
+                json=payload,
+            )
+            response.raise_for_status()
+        ha_last_error = ""
+    except Exception as exc:
+        message = str(exc)
+        if message != ha_last_error:  # log each distinct failure once, not every cycle
+            log.warning("Could not publish to Home Assistant: %s", message)
+        ha_last_error = message
 
 
 def parse_shazam_result(result: dict[str, Any] | None) -> dict[str, str] | None:
@@ -524,10 +563,13 @@ def parse_shazam_result(result: dict[str, Any] | None) -> dict[str, str] | None:
         for item in section.get("metadata", []) or []:
             if item.get("title") == "Album":
                 album = str(item.get("text", ""))
+    images = track.get("images") or {}
+    art = str(images.get("coverarthq") or images.get("coverart") or "")
     return {
         "title": str(track.get("title", "")),
         "artist": str(track.get("subtitle", "")),
         "album": album,
+        "art": art,
     }
 
 
@@ -552,6 +594,7 @@ async def recognize_latest() -> dict[str, Any]:
         last_recognition_key = match_key
         now_playing.update({**match, "source": "Shazam recognition"})
         log.info("Recognized metadata: %s - %s", now_playing["artist"], now_playing["title"])
+        await publish_to_home_assistant()
         return {"ok": True, "now_playing": now_playing}
     except Exception as exc:
         log.exception("Audio recognition failed")
@@ -568,6 +611,7 @@ async def recognize_audio() -> JSONResponse:
 async def auto_recognize_loop() -> None:
     while True:
         await asyncio.sleep(max(15, settings.recognition_interval))
+        await publish_to_home_assistant()
         if not settings.auto_recognize or Shazam is None or not capture.running:
             continue
         result = await recognize_latest()

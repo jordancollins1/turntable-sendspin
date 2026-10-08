@@ -30,6 +30,10 @@ Recognition is automatic and needs no API key. The bridge sends a rolling ~12 se
 
 Recognized metadata is shown on the dashboard and available at `/api/status`. Music Assistant's Sendspin Source plugin does not currently take now-playing metadata from a source client.
 
+## Home Assistant now-playing sensor
+
+When `MA_URL` and `MA_TOKEN` point at Home Assistant (URL plus a long-lived access token), the bridge publishes the current track to `sensor.turntable_now_playing` (change it with `HA_SENSOR`, or set `HA_PUBLISH=false` to turn it off). The sensor's state is the track title, with `artist`, `album` and `source` as attributes. Recognized tracks also set `entity_picture` to the album cover URL from Shazam, so Home Assistant entity and media cards show the art; manually entered tracks have no art. It updates whenever metadata is recognized, set manually or cleared, and is re-sent every recognition interval so it reappears after a Home Assistant restart. The sensor is created through Home Assistant's REST API, so it has no unique ID and can't be edited from the UI.
+
 ## Troubleshooting
 
 - **Test Raspberry Pi** shows the raw SSH/`arecord -l` output, including SSH errors such as host-key or permission failures.
